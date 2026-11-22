@@ -8,9 +8,14 @@ from urllib.parse import urlparse
 
 from blinkpy.auth import UnauthorizedError
 from blinkpy.livestream import BlinkLiveStream
+from freezegun.api import FrozenDateTimeFactory
 import pytest
 from pytest_homeassistant.common import MockConfigEntry
 
+from homeassistant.components.blink.camera import (
+    LIVEVIEW_MIN_DURATION,
+    LIVEVIEW_RETRY_DELAY,
+)
 from homeassistant.components.blink.const import DOMAIN
 from homeassistant.components.camera import DATA_COMPONENT, async_get_stream_source
 from homeassistant.config_entries import SOURCE_REAUTH
@@ -245,3 +250,125 @@ async def test_livestream_server_closed_on_unload(
     url = urlparse(source)
     with pytest.raises(ConnectionRefusedError):
         await asyncio.open_connection(url.hostname, url.port)
+
+
+async def _async_connect_and_wait_closed(hass: HomeAssistant) -> None:
+    """Connect to the livestream server and wait until it disconnects."""
+    reader, writer = await _async_connect(hass)
+    async with asyncio.timeout(5):
+        assert await reader.read() == b""
+    writer.close()
+
+
+@pytest.mark.usefixtures("mock_blink_api", "mock_blink_auth_api", "socket_enabled")
+async def test_livestream_blocked_after_start_failed(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    camera: MagicMock,
+    livestream: MagicMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Test no new liveview is started for a while after one failed to start."""
+    camera.init_livestream.side_effect = [KeyError("server"), livestream]
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    await _async_connect_and_wait_closed(hass)
+    await _async_connect_and_wait_closed(hass)
+    assert camera.init_livestream.await_count == 1
+
+    freezer.tick(LIVEVIEW_RETRY_DELAY)
+    _, writer = await _async_connect(hass)
+    async with asyncio.timeout(5):
+        while not livestream.join.await_count:
+            await asyncio.sleep(0)
+    assert camera.init_livestream.await_count == 2
+    writer.close()
+
+
+@pytest.mark.usefixtures("mock_blink_api", "mock_blink_auth_api", "socket_enabled")
+async def test_livestream_blocked_after_ended_right_away(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    camera: MagicMock,
+    livestream: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test no new liveview is started for a while after Blink ended one right away."""
+    livestream.feed.side_effect = None
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    await _async_connect_and_wait_closed(hass)
+    async with asyncio.timeout(5):
+        while "Blink ended the livestream for Camera 1 right away" not in caplog.text:
+            await asyncio.sleep(0)
+
+    await _async_connect_and_wait_closed(hass)
+    assert camera.init_livestream.await_count == 1
+
+
+@pytest.mark.usefixtures("mock_blink_api", "mock_blink_auth_api", "socket_enabled")
+async def test_livestream_not_blocked_after_long_session(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    camera: MagicMock,
+    livestream: MagicMock,
+    freezer: FrozenDateTimeFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test a new liveview is started after Blink ended a long one."""
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    reader, writer = await _async_connect(hass)
+    async with asyncio.timeout(5):
+        while not livestream.join.await_count:
+            await asyncio.sleep(0)
+    freezer.tick(LIVEVIEW_MIN_DURATION)
+    livestream.stop()
+    async with asyncio.timeout(5):
+        assert await reader.read() == b""
+    writer.close()
+
+    livestream.stopped.clear()
+    _, writer = await _async_connect(hass)
+    async with asyncio.timeout(5):
+        while livestream.join.await_count < 2:
+            await asyncio.sleep(0)
+    assert camera.init_livestream.await_count == 2
+    assert "right away" not in caplog.text
+    writer.close()
+
+
+@pytest.mark.usefixtures("mock_blink_api", "mock_blink_auth_api", "socket_enabled")
+async def test_livestream_not_blocked_when_client_leaves(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    camera: MagicMock,
+    livestream: MagicMock,
+) -> None:
+    """Test a new liveview is started right after the client left the last one."""
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    _, writer = await _async_connect(hass)
+    async with asyncio.timeout(5):
+        while not livestream.join.await_count:
+            await asyncio.sleep(0)
+    writer.close()
+    await writer.wait_closed()
+    async with asyncio.timeout(5):
+        await livestream.stopped.wait()
+
+    livestream.stopped.clear()
+    _, writer = await _async_connect(hass)
+    async with asyncio.timeout(5):
+        while livestream.join.await_count < 2:
+            await asyncio.sleep(0)
+    assert camera.init_livestream.await_count == 2
+    writer.close()

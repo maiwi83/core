@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Mapping
 import logging
+import time
 from typing import Any, override
 
 from blinkpy.auth import UnauthorizedError
@@ -27,6 +28,12 @@ from .coordinator import BlinkConfigEntry, BlinkUpdateCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 PARALLEL_UPDATES = 1
+
+# Blink rejects new liveviews for a while after one fails, and every attempt
+# wakes up the camera, so a liveview that fails or ends within
+# LIVEVIEW_MIN_DURATION seconds blocks new ones for LIVEVIEW_RETRY_DELAY seconds
+LIVEVIEW_MIN_DURATION = 10
+LIVEVIEW_RETRY_DELAY = 120
 
 
 async def async_setup_entry(
@@ -70,6 +77,7 @@ class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
             model=camera.camera_type,
         )
         self._stream_server: asyncio.Server | None = None
+        self._liveview_blocked_until = 0.0
         _LOGGER.debug("Initialized blink camera %s", self._camera.name)
 
     @override
@@ -86,6 +94,9 @@ class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         """Serve a client with a new liveview that ends when the client leaves."""
+        if time.monotonic() < self._liveview_blocked_until:
+            writer.close()
+            return
         # Blink liveview sessions expire, so each connection gets its own
         try:
             livestream = await self._camera.init_livestream()
@@ -98,17 +109,29 @@ class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
                 "Could not start livestream for %s: %s", self._camera.name, err
             )
             writer.close()
+            self._block_liveview()
             return
+        started = time.monotonic()
         feed = self.hass.async_create_background_task(
             livestream.feed(), f"blink livestream {self._camera.name}"
         )
         # Disconnect the client when Blink ends the stream or fails to connect
         feed.add_done_callback(lambda _: livestream.stop())
         await livestream.join(reader, writer)
+        ended_by_blink = feed.done()
         try:
             await feed
         except OSError as err:
             _LOGGER.warning("Livestream for %s failed: %s", self._camera.name, err)
+        if ended_by_blink and time.monotonic() - started < LIVEVIEW_MIN_DURATION:
+            _LOGGER.warning(
+                "Blink ended the livestream for %s right away", self._camera.name
+            )
+            self._block_liveview()
+
+    def _block_liveview(self) -> None:
+        """Do not start new liveviews for a while."""
+        self._liveview_blocked_until = time.monotonic() + LIVEVIEW_RETRY_DELAY
 
     @override
     async def async_will_remove_from_hass(self) -> None:

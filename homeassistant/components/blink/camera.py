@@ -1,5 +1,6 @@
 """Support for Blink system camera."""
 
+import asyncio
 from collections.abc import Mapping
 import logging
 from typing import Any, override
@@ -8,7 +9,7 @@ from blinkpy.auth import UnauthorizedError
 from blinkpy.camera import BlinkCamera as BlinkCameraAPI
 from requests.exceptions import ChunkedEncodingError
 
-from homeassistant.components.camera import Camera
+from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
@@ -49,6 +50,7 @@ class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
 
     _attr_has_entity_name = True
     _attr_name = None
+    _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(
         self, coordinator: BlinkUpdateCoordinator, name, camera: BlinkCameraAPI
@@ -67,7 +69,56 @@ class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
             manufacturer=DEFAULT_BRAND,
             model=camera.camera_type,
         )
+        self._stream_server: asyncio.Server | None = None
         _LOGGER.debug("Initialized blink camera %s", self._camera.name)
+
+    @override
+    async def stream_source(self) -> str | None:
+        """Return the URL of the local livestream server."""
+        if self._stream_server is None or not self._stream_server.is_serving():
+            self._stream_server = await asyncio.start_server(
+                self._async_handle_stream_client, "127.0.0.1", 0
+            )
+        host, port = self._stream_server.sockets[0].getsockname()[:2]
+        return f"tcp://{host}:{port}"
+
+    async def _async_handle_stream_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """Serve a client with a new liveview that ends when the client leaves."""
+        # Blink liveview sessions expire, so each connection gets its own
+        try:
+            livestream = await self._camera.init_livestream()
+        except UnauthorizedError:
+            writer.close()
+            self.coordinator.config_entry.async_start_reauth(self.hass)
+            return
+        except (KeyError, NotImplementedError, TimeoutError, TypeError) as err:
+            _LOGGER.warning(
+                "Could not start livestream for %s: %s", self._camera.name, err
+            )
+            writer.close()
+            return
+        feed = self.hass.async_create_background_task(
+            livestream.feed(), f"blink livestream {self._camera.name}"
+        )
+        # Disconnect the client when Blink ends the stream or fails to connect
+        feed.add_done_callback(lambda _: livestream.stop())
+        await livestream.join(reader, writer)
+        try:
+            await feed
+        except OSError as err:
+            _LOGGER.warning("Livestream for %s failed: %s", self._camera.name, err)
+
+    @override
+    async def async_will_remove_from_hass(self) -> None:
+        """Close the livestream server and the stream using it."""
+        if self._stream_server is not None:
+            self._stream_server.close()
+        if self.stream is not None:
+            await self.stream.stop()
+            self.stream = None
+        await super().async_will_remove_from_hass()
 
     @property
     @override

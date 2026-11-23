@@ -8,10 +8,11 @@ from typing import Any, override
 
 from blinkpy.auth import UnauthorizedError
 from blinkpy.camera import BlinkCamera as BlinkCameraAPI
+from blinkpy.livestream import BlinkLiveStream
 from requests.exceptions import ChunkedEncodingError
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     HomeAssistantError,
@@ -52,6 +53,13 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
+def _liveview_stopped(livestream: BlinkLiveStream) -> bool:
+    """Return if the liveview was stopped or Blink closed its connection."""
+    return livestream.target_writer is not None and (
+        livestream.target_writer.is_closing() or livestream.target_reader.at_eof()
+    )
+
+
 class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
     """An implementation of a Blink Camera."""
 
@@ -77,6 +85,8 @@ class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
             model=camera.camera_type,
         )
         self._stream_server: asyncio.Server | None = None
+        self._livestream: BlinkLiveStream | None = None
+        self._liveview_lock = asyncio.Lock()
         self._liveview_blocked_until = 0.0
         _LOGGER.debug("Initialized blink camera %s", self._camera.name)
 
@@ -93,32 +103,27 @@ class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
     async def _async_handle_stream_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        """Serve a client with a new liveview that ends when the client leaves."""
-        if time.monotonic() < self._liveview_blocked_until:
-            writer.close()
-            return
-        # Blink liveview sessions expire, so each connection gets its own
-        try:
-            livestream = await self._camera.init_livestream()
-        except UnauthorizedError:
-            writer.close()
-            self.coordinator.config_entry.async_start_reauth(self.hass)
-            return
-        except (KeyError, NotImplementedError, TimeoutError, TypeError) as err:
-            _LOGGER.warning(
-                "Could not start livestream for %s: %s", self._camera.name, err
-            )
-            writer.close()
-            self._block_liveview()
-            return
-        started = time.monotonic()
-        feed = self.hass.async_create_background_task(
-            livestream.feed(), f"blink livestream {self._camera.name}"
-        )
-        # Disconnect the client when Blink ends the stream or fails to connect
-        feed.add_done_callback(lambda _: livestream.stop())
+        """Serve a client with a liveview that ends when the last client leaves."""
+        # Blink allows one liveview per camera, so clients share a running one
+        async with self._liveview_lock:
+            if (livestream := self._livestream) is not None and not _liveview_stopped(
+                livestream
+            ):
+                feed = None
+            elif (livestream := await self._async_start_liveview()) is None:
+                writer.close()
+                return
+            else:
+                started = time.monotonic()
+                feed = self._async_feed_liveview(livestream)
         await livestream.join(reader, writer)
-        ended_by_blink = feed.done()
+        if feed is None:
+            return
+        # Blink closed the connection if the client left after it, even if
+        # blinkpy is still polling the command API and the feed is running
+        ended_by_blink = feed.done() or (
+            livestream.target_reader is not None and livestream.target_reader.at_eof()
+        )
         try:
             await feed
         except OSError as err:
@@ -128,6 +133,39 @@ class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
                 "Blink ended the livestream for %s right away", self._camera.name
             )
             self._block_liveview()
+
+    async def _async_start_liveview(self) -> BlinkLiveStream | None:
+        """Start a new liveview, unless liveviews are blocked or it fails."""
+        if time.monotonic() < self._liveview_blocked_until:
+            return None
+        # Blink liveview sessions expire, so a new liveview is started each time
+        try:
+            return await self._camera.init_livestream()
+        except UnauthorizedError:
+            self.coordinator.config_entry.async_start_reauth(self.hass)
+        except (KeyError, NotImplementedError, TimeoutError, TypeError) as err:
+            _LOGGER.warning(
+                "Could not start livestream for %s: %s", self._camera.name, err
+            )
+            self._block_liveview()
+        return None
+
+    def _async_feed_liveview(self, livestream: BlinkLiveStream) -> asyncio.Task[None]:
+        """Stream the liveview to its clients until it ends."""
+        self._livestream = livestream
+        feed = self.hass.async_create_background_task(
+            livestream.feed(), f"blink livestream {self._camera.name}"
+        )
+
+        @callback
+        def _async_feed_done(_: asyncio.Task[None]) -> None:
+            # Disconnect the clients when Blink ends the stream or fails to connect
+            livestream.stop()
+            if self._livestream is livestream:
+                self._livestream = None
+
+        feed.add_done_callback(_async_feed_done)
+        return feed
 
     def _block_liveview(self) -> None:
         """Do not start new liveviews for a while."""

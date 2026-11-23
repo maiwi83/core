@@ -84,23 +84,36 @@ async def test_write_error_raises_translated_error(
 
 @pytest.fixture
 def livestream(camera: MagicMock) -> MagicMock:
-    """Return a liveview that streams until it is stopped or the client leaves."""
+    """Return a liveview that streams until it is stopped or the last client leaves."""
     livestream = create_autospec(BlinkLiveStream, instance=True)
     stopped = asyncio.Event()
-    clients: list[asyncio.StreamWriter] = []
+    livestream.clients = []
+    livestream.target_reader = None
+    livestream.target_writer = None
 
     def stop() -> None:
-        for writer in clients:
+        if livestream.target_writer is not None:
+            livestream.target_writer.close()
+        for writer in livestream.clients:
             writer.close()
         stopped.set()
 
     async def join(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        clients.append(writer)
+        livestream.clients.append(writer)
         await reader.read()
+        livestream.clients.remove(writer)
         # Like blinkpy, stop the liveview when the last client leaves
-        stop()
+        if not livestream.clients:
+            stop()
 
     async def feed() -> None:
+        # Connect to Blink like blinkpy does
+        livestream.target_reader = asyncio.StreamReader()
+        livestream.target_writer = MagicMock()
+        livestream.target_writer.is_closing.return_value = False
+        livestream.target_writer.close.side_effect = lambda: (
+            livestream.target_writer.is_closing.configure_mock(return_value=True)
+        )
         await stopped.wait()
 
     livestream.join.side_effect = join
@@ -372,3 +385,76 @@ async def test_livestream_not_blocked_when_client_leaves(
             await asyncio.sleep(0)
     assert camera.init_livestream.await_count == 2
     writer.close()
+
+
+@pytest.mark.usefixtures("mock_blink_api", "mock_blink_auth_api", "socket_enabled")
+async def test_livestream_shared(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    camera: MagicMock,
+    livestream: MagicMock,
+) -> None:
+    """Test clients connecting at the same time share one liveview."""
+    started = asyncio.Event()
+
+    async def init_livestream() -> MagicMock:
+        await started.wait()
+        return livestream
+
+    camera.init_livestream.side_effect = init_livestream
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    _, writer1 = await _async_connect(hass)
+    _, writer2 = await _async_connect(hass)
+    started.set()
+    async with asyncio.timeout(5):
+        while livestream.join.await_count < 2:
+            await asyncio.sleep(0)
+    camera.init_livestream.assert_awaited_once()
+    livestream.feed.assert_called_once()
+
+    writer1.close()
+    await writer1.wait_closed()
+    async with asyncio.timeout(5):
+        while len(livestream.clients) > 1:
+            await asyncio.sleep(0)
+    assert not livestream.stopped.is_set()
+
+    writer2.close()
+    await writer2.wait_closed()
+    async with asyncio.timeout(5):
+        await livestream.stopped.wait()
+
+
+@pytest.mark.usefixtures("mock_blink_api", "mock_blink_auth_api", "socket_enabled")
+async def test_livestream_blocked_after_blink_disconnected(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    camera: MagicMock,
+    livestream: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test a liveview counts as ended by Blink when Blink closed the connection.
+
+    blinkpy keeps polling the command API after Blink closed the connection, so
+    the client leaves before the feed is done.
+    """
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    _, writer = await _async_connect(hass)
+    async with asyncio.timeout(5):
+        while livestream.target_reader is None or not livestream.join.await_count:
+            await asyncio.sleep(0)
+    livestream.target_reader.feed_eof()
+    writer.close()
+    await writer.wait_closed()
+    async with asyncio.timeout(5):
+        while "Blink ended the livestream for Camera 1 right away" not in caplog.text:
+            await asyncio.sleep(0)
+
+    await _async_connect_and_wait_closed(hass)
+    assert camera.init_livestream.await_count == 1

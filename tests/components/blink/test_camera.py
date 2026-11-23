@@ -13,6 +13,8 @@ import pytest
 from pytest_homeassistant.common import MockConfigEntry
 
 from homeassistant.components.blink.camera import (
+    HTTP_RESPONSE_OK,
+    HTTP_RESPONSE_UNAVAILABLE,
     LIVEVIEW_MIN_DURATION,
     LIVEVIEW_RETRY_DELAY,
 )
@@ -100,11 +102,15 @@ def livestream(camera: MagicMock) -> MagicMock:
 
     async def join(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         livestream.clients.append(writer)
-        await reader.read()
-        livestream.clients.remove(writer)
-        # Like blinkpy, stop the liveview when the last client leaves
-        if not livestream.clients:
-            stop()
+        try:
+            await reader.read()
+        except ConnectionResetError:
+            pass
+        finally:
+            livestream.clients.remove(writer)
+            # Like blinkpy, stop the liveview when the last client leaves
+            if not livestream.clients:
+                stop()
 
     async def feed() -> None:
         # Connect to Blink like blinkpy does
@@ -125,15 +131,17 @@ def livestream(camera: MagicMock) -> MagicMock:
 
 
 async def _async_connect(
-    hass: HomeAssistant,
+    hass: HomeAssistant, method: str = "GET"
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-    """Connect to the livestream server of the camera."""
+    """Connect to the livestream server of the camera and request the stream."""
     source = await async_get_stream_source(hass, CAMERA_ENTITY_ID)
     assert source is not None
     url = urlparse(source)
-    assert url.scheme == "tcp"
+    assert url.scheme == "http"
     assert url.hostname == "127.0.0.1"
-    return await asyncio.open_connection(url.hostname, url.port)
+    reader, writer = await asyncio.open_connection(url.hostname, url.port)
+    writer.write(f"{method} / HTTP/1.1\r\nHost: {url.netloc}\r\n\r\n".encode())
+    return reader, writer
 
 
 @pytest.mark.usefixtures("mock_blink_api", "mock_blink_auth_api", "socket_enabled")
@@ -180,7 +188,7 @@ async def test_livestream_ended_by_blink(
 
     reader, writer = await _async_connect(hass)
     async with asyncio.timeout(5):
-        assert await reader.read() == b""
+        assert await reader.read() == HTTP_RESPONSE_OK
         await livestream.stopped.wait()
         while "Livestream for Camera 1 failed" not in caplog.text:
             await asyncio.sleep(0)
@@ -212,7 +220,7 @@ async def test_livestream_start_failed(
 
     reader, writer = await _async_connect(hass)
     async with asyncio.timeout(5):
-        assert await reader.read() == b""
+        assert await reader.read() == HTTP_RESPONSE_UNAVAILABLE
     writer.close()
     assert "Could not start livestream for Camera 1" in caplog.text
 
@@ -231,7 +239,7 @@ async def test_livestream_unauthorized(
 
     reader, writer = await _async_connect(hass)
     async with asyncio.timeout(5):
-        assert await reader.read() == b""
+        assert await reader.read() == HTTP_RESPONSE_UNAVAILABLE
     writer.close()
     await hass.async_block_till_done()
 
@@ -265,11 +273,11 @@ async def test_livestream_server_closed_on_unload(
         await asyncio.open_connection(url.hostname, url.port)
 
 
-async def _async_connect_and_wait_closed(hass: HomeAssistant) -> None:
-    """Connect to the livestream server and wait until it disconnects."""
+async def _async_connect_and_wait_closed(hass: HomeAssistant, response: bytes) -> None:
+    """Request the stream and wait until the server disconnects."""
     reader, writer = await _async_connect(hass)
     async with asyncio.timeout(5):
-        assert await reader.read() == b""
+        assert await reader.read() == response
     writer.close()
 
 
@@ -287,8 +295,8 @@ async def test_livestream_blocked_after_start_failed(
     assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
-    await _async_connect_and_wait_closed(hass)
-    await _async_connect_and_wait_closed(hass)
+    await _async_connect_and_wait_closed(hass, HTTP_RESPONSE_UNAVAILABLE)
+    await _async_connect_and_wait_closed(hass, HTTP_RESPONSE_UNAVAILABLE)
     assert camera.init_livestream.await_count == 1
 
     freezer.tick(LIVEVIEW_RETRY_DELAY)
@@ -314,12 +322,12 @@ async def test_livestream_blocked_after_ended_right_away(
     assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
 
-    await _async_connect_and_wait_closed(hass)
+    await _async_connect_and_wait_closed(hass, HTTP_RESPONSE_OK)
     async with asyncio.timeout(5):
         while "Blink ended the livestream for Camera 1 right away" not in caplog.text:
             await asyncio.sleep(0)
 
-    await _async_connect_and_wait_closed(hass)
+    await _async_connect_and_wait_closed(hass, HTTP_RESPONSE_UNAVAILABLE)
     assert camera.init_livestream.await_count == 1
 
 
@@ -344,7 +352,7 @@ async def test_livestream_not_blocked_after_long_session(
     freezer.tick(LIVEVIEW_MIN_DURATION)
     livestream.stop()
     async with asyncio.timeout(5):
-        assert await reader.read() == b""
+        assert await reader.read() == HTTP_RESPONSE_OK
     writer.close()
 
     livestream.stopped.clear()
@@ -456,5 +464,46 @@ async def test_livestream_blocked_after_blink_disconnected(
         while "Blink ended the livestream for Camera 1 right away" not in caplog.text:
             await asyncio.sleep(0)
 
-    await _async_connect_and_wait_closed(hass)
+    await _async_connect_and_wait_closed(hass, HTTP_RESPONSE_UNAVAILABLE)
     assert camera.init_livestream.await_count == 1
+
+
+@pytest.mark.usefixtures("mock_blink_api", "mock_blink_auth_api", "socket_enabled")
+async def test_livestream_head_request(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    camera: MagicMock,
+) -> None:
+    """Test a HEAD request does not start a liveview."""
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    reader, writer = await _async_connect(hass, "HEAD")
+    async with asyncio.timeout(5):
+        assert await reader.read() == HTTP_RESPONSE_OK
+    writer.close()
+    camera.init_livestream.assert_not_called()
+
+
+@pytest.mark.usefixtures("mock_blink_api", "mock_blink_auth_api", "socket_enabled")
+async def test_livestream_no_request(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    camera: MagicMock,
+) -> None:
+    """Test a client leaving without a request does not start a liveview."""
+    mock_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    source = await async_get_stream_source(hass, CAMERA_ENTITY_ID)
+    assert source is not None
+    url = urlparse(source)
+
+    reader, writer = await asyncio.open_connection(url.hostname, url.port)
+    writer.write(b"GET / HTTP/1.1\r\n")
+    writer.write_eof()
+    async with asyncio.timeout(5):
+        assert await reader.read() == b""
+    writer.close()
+    camera.init_livestream.assert_not_called()

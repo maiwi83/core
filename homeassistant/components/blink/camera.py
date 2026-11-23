@@ -36,6 +36,14 @@ PARALLEL_UPDATES = 1
 LIVEVIEW_MIN_DURATION = 10
 LIVEVIEW_RETRY_DELAY = 120
 
+# The livestream is served over HTTP, as go2rtc does not report a URL for a
+# connected tcp:// source, which the go2rtc integration relies on
+HTTP_REQUEST_TIMEOUT = 10
+HTTP_RESPONSE_OK = (
+    b"HTTP/1.0 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-cache\r\n\r\n"
+)
+HTTP_RESPONSE_UNAVAILABLE = b"HTTP/1.0 503 Service Unavailable\r\n\r\n"
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -98,12 +106,23 @@ class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
                 self._async_handle_stream_client, "127.0.0.1", 0
             )
         host, port = self._stream_server.sockets[0].getsockname()[:2]
-        return f"tcp://{host}:{port}"
+        return f"http://{host}:{port}/"
 
     async def _async_handle_stream_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         """Serve a client with a liveview that ends when the last client leaves."""
+        try:
+            async with asyncio.timeout(HTTP_REQUEST_TIMEOUT):
+                request = await reader.readuntil(b"\r\n\r\n")
+        except OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError:
+            writer.close()
+            return
+        # Do not wake up the camera for a client only checking the stream
+        if request.startswith(b"HEAD "):
+            writer.write(HTTP_RESPONSE_OK)
+            writer.close()
+            return
         # Blink allows one liveview per camera, so clients share a running one
         async with self._liveview_lock:
             if (livestream := self._livestream) is not None and not _liveview_stopped(
@@ -111,11 +130,13 @@ class BlinkCamera(CoordinatorEntity[BlinkUpdateCoordinator], Camera):
             ):
                 feed = None
             elif (livestream := await self._async_start_liveview()) is None:
+                writer.write(HTTP_RESPONSE_UNAVAILABLE)
                 writer.close()
                 return
             else:
                 started = time.monotonic()
                 feed = self._async_feed_liveview(livestream)
+        writer.write(HTTP_RESPONSE_OK)
         await livestream.join(reader, writer)
         if feed is None:
             return
